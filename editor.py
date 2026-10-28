@@ -1,13 +1,17 @@
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QToolBar, QAction, QActionGroup, QSlider, QLabel, QScrollArea,
-    QFileDialog, QMessageBox, QLineEdit, QApplication, QDockWidget
+    QFileDialog, QMessageBox, QLineEdit, QApplication, QDockWidget,
+    QComboBox, QInputDialog
 )
 from PyQt5.QtGui import QColor
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from annotation_canvas import AnnotationCanvas
 from ocr_engine import extract_text_with_positions
 from ai_engine import get_actions
+from settings_dialog import SettingsDialog
+from database import log_prompt, add_template, list_templates
+import json
 import os
 
 
@@ -54,10 +58,12 @@ class AIWorker(QThread):
 
 
 class EditorWindow(QMainWindow):
-    def __init__(self, image_path):
+    def __init__(self, image_path, capture_id=None):
         super().__init__()
         self.image_path = image_path
+        self.capture_id = capture_id
         self.worker = None
+        self.last_prompt = ""
         self.setWindowTitle("Editor - Screenshot Capture & Annotation Utility")
         self.resize(1100, 750)
 
@@ -81,11 +87,20 @@ class EditorWindow(QMainWindow):
         row = QHBoxLayout(bar)
         row.setContentsMargins(0, 0, 0, 0)
 
+        self.template_box = QComboBox()
+        self.template_box.activated.connect(self.use_template)
+        row.addWidget(self.template_box)
+        self._refresh_templates()
+
         self.prompt_input = QLineEdit()
         self.prompt_input.setPlaceholderText(
             "Tell the AI what to do, e.g. blur the email address")
         self.prompt_input.returnPressed.connect(self.run_ai_prompt)
-        row.addWidget(self.prompt_input)
+        row.addWidget(self.prompt_input, 1)
+
+        save_tpl_btn = QPushButton("★ Save template")
+        save_tpl_btn.clicked.connect(self.save_template)
+        row.addWidget(save_tpl_btn)
 
         self.ai_btn = QPushButton("✨ Apply AI")
         self.ai_btn.clicked.connect(self.run_ai_prompt)
@@ -95,10 +110,32 @@ class EditorWindow(QMainWindow):
         row.addWidget(self.ai_status)
         return bar
 
+    def _refresh_templates(self):
+        self.template_box.clear()
+        self.template_box.addItem("Templates...", "")
+        for template_id, name, content in list_templates("prompt"):
+            self.template_box.addItem(name, content)
+
+    def use_template(self, index):
+        content = self.template_box.itemData(index)
+        if content:
+            self.prompt_input.setText(content)
+
+    def save_template(self):
+        text = self.prompt_input.text().strip()
+        if not text:
+            return
+        name, ok = QInputDialog.getText(
+            self, "Save template", "Template name:", QLineEdit.Normal, text[:30])
+        if ok and name.strip():
+            add_template(name.strip(), "prompt", text)
+            self._refresh_templates()
+
     def run_ai_prompt(self):
         prompt = self.prompt_input.text().strip()
         if not prompt:
             return
+        self.last_prompt = prompt
         self.ai_btn.setEnabled(False)
         self.ai_status.setText("AI is working...")
 
@@ -111,6 +148,7 @@ class EditorWindow(QMainWindow):
 
     def on_ai_done(self, actions):
         self.ai_btn.setEnabled(True)
+        log_prompt(self.capture_id, self.last_prompt, json.dumps(actions), "ok")
         if not actions:
             self.ai_status.setText("AI found nothing to change.")
             return
@@ -119,6 +157,7 @@ class EditorWindow(QMainWindow):
 
     def on_ai_failed(self, message):
         self.ai_btn.setEnabled(True)
+        log_prompt(self.capture_id, self.last_prompt, message, "error")
         self.ai_status.setText("AI failed. Manual tools still work.")
         QMessageBox.warning(self, "AI error", message)
 
@@ -175,6 +214,10 @@ class EditorWindow(QMainWindow):
         copy_btn.clicked.connect(self.copy_to_clipboard)
         side_layout.addWidget(copy_btn)
 
+        settings_btn = QPushButton("⚙ Settings")
+        settings_btn.clicked.connect(self.open_settings)
+        side_layout.addWidget(settings_btn)
+
         side_layout.addStretch()
         side_panel.setLayout(side_layout)
         side_panel.setFixedWidth(150)
@@ -183,6 +226,9 @@ class EditorWindow(QMainWindow):
         dock.setWidget(side_panel)
         dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
+
+    def open_settings(self):
+        SettingsDialog(self).exec_()
 
     # ---------- Save / Copy ----------
     def save_image(self):

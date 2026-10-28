@@ -1,8 +1,10 @@
 import os
 import json
+import time
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from database import get_setting
 
 load_dotenv()
 
@@ -56,10 +58,14 @@ def _clean(actions, width, height):
     return cleaned
 
 
+def _is_busy(error_text):
+    return "503" in error_text or "UNAVAILABLE" in error_text or "429" in error_text
+
+
 def get_actions(user_prompt, ocr_items, width, height):
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = get_setting("api_key") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise AIError("GEMINI_API_KEY not found in the .env file")
+        raise AIError("No API key found. Open Settings and paste your Gemini API key.")
 
     words = "\n".join(
         f"{i['text']}|{i['left']}|{i['top']}|{i['width']}|{i['height']}"
@@ -69,16 +75,27 @@ def get_actions(user_prompt, ocr_items, width, height):
               .replace("__W__", str(width)).replace("__H__", str(height))
               .replace("__WORDS__", words).replace("__REQUEST__", user_prompt))
 
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash"),
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json", temperature=0),
-        )
-    except Exception as e:
-        raise AIError(f"AI request failed: {e}")
+    model_name = get_setting("model") or os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+
+    response = None
+    for attempt in range(3):
+        try:
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json", temperature=0),
+            )
+            break
+        except Exception as e:
+            text = str(e)
+            if _is_busy(text) and attempt < 2:
+                time.sleep(3 * (attempt + 1))
+                continue
+            if _is_busy(text):
+                raise AIError("The AI service is busy right now. Please wait a minute and try again.")
+            raise AIError(f"AI request failed: {text}")
 
     try:
         data = json.loads(response.text or "{}")
