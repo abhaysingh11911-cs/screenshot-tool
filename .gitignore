@@ -1,0 +1,6 @@
+venv/
+.env
+captures/
+perf_captures/
+__pycache__/
+app_data.db
