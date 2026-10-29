@@ -1,7 +1,9 @@
 import os
 import sqlite3
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_data.db")
+APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "ScreenshotTool")
+os.makedirs(APP_DIR, exist_ok=True)
+DB_PATH = os.path.join(APP_DIR, "app_data.db")
 
 
 def _execute(sql, params=(), fetch=False):
