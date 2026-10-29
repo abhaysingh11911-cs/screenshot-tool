@@ -4,3 +4,6 @@ captures/
 perf_captures/
 __pycache__/
 app_data.db
+dist/
+build/
+*.spec

@@ -1,44 +1,39 @@
+import io
+import math
 from PyQt5.QtWidgets import QWidget, QInputDialog
 from PyQt5.QtGui import QPainter, QPixmap, QPen, QColor, QFont, QPolygon
-from PyQt5.QtCore import Qt, QPoint, QRect
+from PyQt5.QtCore import Qt, QPoint, QRect, QBuffer
 from PIL import Image, ImageFilter
-from PyQt5.QtCore import QBuffer, QByteArray
-import io
 
 
 def qpixmap_to_pil(pixmap):
-    qimage = pixmap.toImage()
-    buffer = io.BytesIO()
-    qimage.save_buffer = None
-    from PyQt5.QtCore import QBuffer
     qbuffer = QBuffer()
     qbuffer.open(QBuffer.ReadWrite)
-    qimage.save(qbuffer, "PNG")
-    pil_image = Image.open(io.BytesIO(qbuffer.data()))
-    return pil_image.convert("RGB")
+    pixmap.toImage().save(qbuffer, "PNG")
+    return Image.open(io.BytesIO(bytes(qbuffer.data()))).convert("RGB")
 
 
 def pil_to_qpixmap(pil_image):
     buffer = io.BytesIO()
     pil_image.save(buffer, format="PNG")
-    qpixmap = QPixmap()
-    qpixmap.loadFromData(buffer.getvalue())
-    return qpixmap
+    pixmap = QPixmap()
+    pixmap.loadFromData(buffer.getvalue())
+    return pixmap
 
 
 class AnnotationCanvas(QWidget):
-    TOOLS = ["pen", "arrow", "rectangle", "circle", "text",
-             "highlight", "eraser", "blur", "number"]
-
-    def __init__(self, image_path, parent=None):
+    def __init__(self, image_path=None, parent=None):
         super().__init__(parent)
-        self.original_pixmap = QPixmap(image_path)
-        self.base_pixmap = self.original_pixmap.copy()  # what's actually "saved"
-
+        self.has_image = bool(image_path)
+        if self.has_image:
+            self.original_pixmap = QPixmap(image_path)
+        else:
+            self.original_pixmap = self._placeholder()
+        self.base_pixmap = self.original_pixmap.copy()
         self.setFixedSize(self.base_pixmap.size())
 
         self.current_tool = "pen"
-        self.pen_color = QColor(255, 0, 0)  # default red
+        self.pen_color = QColor(255, 0, 0)
         self.thickness = 4
 
         self.drawing = False
@@ -47,12 +42,25 @@ class AnnotationCanvas(QWidget):
         self.current_pos = QPoint()
 
         self.number_counter = 1
-
-        # Undo/redo history (list of pixmap snapshots)
         self.undo_stack = [self.base_pixmap.copy()]
         self.redo_stack = []
 
-    # ---------- Tool/color/thickness setters (called from toolbar) ----------
+    def _placeholder(self):
+        pixmap = QPixmap(900, 520)
+        pixmap.fill(QColor("#2a2c31"))
+        return pixmap
+
+    def load_image(self, image_path):
+        self.has_image = True
+        self.original_pixmap = QPixmap(image_path)
+        self.base_pixmap = self.original_pixmap.copy()
+        self.setFixedSize(self.base_pixmap.size())
+        self.number_counter = 1
+        self.undo_stack = [self.base_pixmap.copy()]
+        self.redo_stack = []
+        self.update()
+
+    # ---------- Setters used by the toolbar ----------
     def set_tool(self, tool_name):
         self.current_tool = tool_name
 
@@ -67,21 +75,26 @@ class AnnotationCanvas(QWidget):
         painter = QPainter(self)
         painter.drawPixmap(0, 0, self.base_pixmap)
 
-        # Draw a live preview for shape tools while dragging
+        if not self.has_image:
+            painter.setPen(QColor("#8a8f98"))
+            painter.setFont(QFont("Arial", 14))
+            painter.drawText(self.rect(), Qt.AlignCenter,
+                             "Click Capture or Area Select to begin")
+            return
+
         if self.drawing and self.current_tool in ("arrow", "rectangle", "circle", "blur"):
-            pen = QPen(self.pen_color, self.thickness)
-            painter.setPen(pen)
-            if self.current_tool == "rectangle" or self.current_tool == "blur":
-                rect = QRect(self.start_pos, self.current_pos).normalized()
-                painter.drawRect(rect)
+            painter.setPen(QPen(self.pen_color, self.thickness))
+            if self.current_tool in ("rectangle", "blur"):
+                painter.drawRect(QRect(self.start_pos, self.current_pos).normalized())
             elif self.current_tool == "circle":
-                rect = QRect(self.start_pos, self.current_pos).normalized()
-                painter.drawEllipse(rect)
+                painter.drawEllipse(QRect(self.start_pos, self.current_pos).normalized())
             elif self.current_tool == "arrow":
                 self._draw_arrow(painter, self.start_pos, self.current_pos)
 
     # ---------- Mouse events ----------
     def mousePressEvent(self, event):
+        if not self.has_image:
+            return
         self.start_pos = event.pos()
         self.last_pos = event.pos()
         self.current_pos = event.pos()
@@ -97,13 +110,10 @@ class AnnotationCanvas(QWidget):
     def mouseMoveEvent(self, event):
         if not self.drawing:
             return
-
         self.current_pos = event.pos()
-
         if self.current_tool in ("pen", "highlight", "eraser"):
             self._draw_freehand_segment(self.last_pos, event.pos())
             self.last_pos = event.pos()
-
         self.update()
 
     def mouseReleaseEvent(self, event):
@@ -121,8 +131,7 @@ class AnnotationCanvas(QWidget):
         elif self.current_tool == "blur":
             self._commit_blur(self.start_pos, event.pos())
         elif self.current_tool in ("pen", "highlight", "eraser"):
-            self._push_undo_snapshot()  # freehand already drawn live; just checkpoint it
-
+            self._push_undo_snapshot()
         self.update()
 
     # ---------- Tool implementations ----------
@@ -140,48 +149,36 @@ class AnnotationCanvas(QWidget):
             painter.setPen(pen)
             painter.drawLine(p1, p2)
         elif self.current_tool == "eraser":
-            # "Erase" by restoring the original screenshot pixels in this area
-            eraser_size = max(self.thickness * 3, 16)
-            rect = QRect(p2.x() - eraser_size // 2, p2.y() - eraser_size // 2,
-                         eraser_size, eraser_size)
+            size = max(self.thickness * 3, 16)
+            rect = QRect(p2.x() - size // 2, p2.y() - size // 2, size, size)
             painter.drawPixmap(rect, self.original_pixmap, rect)
         painter.end()
 
     def _commit_rectangle(self, p1, p2):
         painter = QPainter(self.base_pixmap)
-        pen = QPen(self.pen_color, self.thickness)
-        painter.setPen(pen)
+        painter.setPen(QPen(self.pen_color, self.thickness))
         painter.drawRect(QRect(p1, p2).normalized())
         painter.end()
         self._push_undo_snapshot()
 
     def _commit_circle(self, p1, p2):
         painter = QPainter(self.base_pixmap)
-        pen = QPen(self.pen_color, self.thickness)
-        painter.setPen(pen)
+        painter.setPen(QPen(self.pen_color, self.thickness))
         painter.drawEllipse(QRect(p1, p2).normalized())
         painter.end()
         self._push_undo_snapshot()
 
     def _draw_arrow(self, painter, p1, p2):
-        pen = QPen(self.pen_color, self.thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-        painter.setPen(pen)
+        painter.setPen(QPen(self.pen_color, self.thickness, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         painter.setBrush(self.pen_color)
         painter.drawLine(p1, p2)
 
-        # Arrowhead
-        import math
         angle = math.atan2(p1.y() - p2.y(), p1.x() - p2.x())
-        arrow_size = 12 + self.thickness
-
-        p3 = QPoint(
-            int(p2.x() + arrow_size * math.cos(angle + math.pi / 6)),
-            int(p2.y() + arrow_size * math.sin(angle + math.pi / 6)),
-        )
-        p4 = QPoint(
-            int(p2.x() + arrow_size * math.cos(angle - math.pi / 6)),
-            int(p2.y() + arrow_size * math.sin(angle - math.pi / 6)),
-        )
+        size = 12 + self.thickness
+        p3 = QPoint(int(p2.x() + size * math.cos(angle + math.pi / 6)),
+                    int(p2.y() + size * math.sin(angle + math.pi / 6)))
+        p4 = QPoint(int(p2.x() + size * math.cos(angle - math.pi / 6)),
+                    int(p2.y() + size * math.sin(angle - math.pi / 6)))
         painter.drawPolygon(QPolygon([p2, p3, p4]))
 
     def _commit_arrow(self, p1, p2):
@@ -194,12 +191,10 @@ class AnnotationCanvas(QWidget):
         rect = QRect(p1, p2).normalized()
         if rect.width() < 4 or rect.height() < 4:
             return
-
         pil_image = qpixmap_to_pil(self.base_pixmap)
         region = pil_image.crop((rect.left(), rect.top(), rect.right(), rect.bottom()))
         blurred = region.filter(ImageFilter.GaussianBlur(radius=12))
         pil_image.paste(blurred, (rect.left(), rect.top()))
-
         self.base_pixmap = pil_to_qpixmap(pil_image)
         self._push_undo_snapshot()
 
@@ -208,14 +203,12 @@ class AnnotationCanvas(QWidget):
         if ok and text:
             painter = QPainter(self.base_pixmap)
             painter.setPen(QPen(self.pen_color))
-            font = QFont("Arial", 14 + self.thickness)
-            painter.setFont(font)
-            metrics = painter.fontMetrics()
-            text_pos = QPoint(pos.x(), pos.y() + metrics.ascent())
-            painter.drawText(text_pos, text)
+            painter.setFont(QFont("Arial", 14 + self.thickness))
+            ascent = painter.fontMetrics().ascent()
+            painter.drawText(QPoint(pos.x(), pos.y() + ascent), text)
             painter.end()
             self._push_undo_snapshot()
-            self.update()    
+            self.update()
 
     def _handle_number_click(self, pos):
         painter = QPainter(self.base_pixmap)
@@ -223,18 +216,18 @@ class AnnotationCanvas(QWidget):
         painter.setBrush(self.pen_color)
         painter.setPen(QPen(Qt.white, 2))
         painter.drawEllipse(pos, radius, radius)
-
         painter.setPen(QPen(Qt.white))
         font = QFont("Arial", 12)
         font.setBold(True)
         painter.setFont(font)
-        text_rect = QRect(pos.x() - radius, pos.y() - radius, radius * 2, radius * 2)
-        painter.drawText(text_rect, Qt.AlignCenter, str(self.number_counter))
+        painter.drawText(QRect(pos.x() - radius, pos.y() - radius, radius * 2, radius * 2),
+                         Qt.AlignCenter, str(self.number_counter))
         painter.end()
-
         self.number_counter += 1
         self._push_undo_snapshot()
         self.update()
+
+    # ---------- AI edits ----------
     def apply_ai_actions(self, actions):
         colors = {
             "red": QColor(255, 0, 0), "green": QColor(0, 170, 0),
@@ -272,8 +265,7 @@ class AnnotationCanvas(QWidget):
             elif tool == "text":
                 painter = QPainter(self.base_pixmap)
                 painter.setPen(QPen(self.pen_color))
-                font = QFont("Arial", 14 + self.thickness)
-                painter.setFont(font)
+                painter.setFont(QFont("Arial", 14 + self.thickness))
                 ascent = painter.fontMetrics().ascent()
                 painter.drawText(QPoint(x, y + h + ascent + 2), a["text"])
                 painter.end()
@@ -283,6 +275,7 @@ class AnnotationCanvas(QWidget):
 
         self.pen_color = original_color
         self.update()
+
     # ---------- Undo / Redo ----------
     def _push_undo_snapshot(self):
         self.undo_stack.append(self.base_pixmap.copy())
